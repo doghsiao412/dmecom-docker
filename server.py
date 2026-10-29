@@ -34,6 +34,7 @@ from device_voices_ui import render_device_voices,render_voice_confirmation
 from voice_names import VoiceNames,label_for
 from media import serve_wav
 from recording_ui import recording_player
+from retry_ui import render_retries
 from live_monitor import LiveMonitor,LiveError
 from live_ui import render_live
 ROOT=Path(__file__).resolve().parent
@@ -109,11 +110,13 @@ def shell(title,content):
 def main_page(filters,message=''):
     result=ARCHIVE.search(**filters);rows=result['rows'];s=BACKUP.status()
     content='<p class="ok">'+esc(message)+'</p>' if message else ''
-    content+='<section class="backup-overview"><div class="section-heading"><div><h2>備份概況</h2><p>每 '+str(BACKUP.interval//60)+' 分鐘同步新錄音，歷史備份在背景持續執行。</p></div>'
+    history_note='歷史掃描已停止。' if ARCHIVE.get('history_stop_record') else '歷史備份在背景持續執行。'
+    content+='<section class="backup-overview"><div class="section-heading"><div><h2>備份概況</h2><p>每 '+str(BACKUP.interval//60)+' 分鐘同步新錄音；'+history_note+'</p></div>'
     content+=form('/backup','<button id="backup-button"'+(' disabled' if s.get('running') else '')+'>'+('備份進行中' if s.get('running') else '立即備份')+'</button>')+'</div><div class="metrics">'
     for key,label in [('saved','已備份'),('total','已找到錄音'),('failed','待重試')]:
-        content+='<div class="stat'+(' metric-warning' if key=='failed' and s[key] else '')+'"><span>'+label+'</span><strong id="'+key+'">'+str(s[key])+'</strong><small>筆錄音</small></div>'
-    content+='</div><div class="backup-progress"><p id="progress"></p><p class="error" id="backup-error"></p><small id="timing"></small></div><details><summary>備份位置與說明</summary><p>儲存位置：<code>/volume1/電話錄音</code>，錄音保存在 pcm。系統會補抓設備可提供的歷史錄音；已刪除或覆寫的錄音無法補抓。</p></details></section>'
+        tag='a' if key=='failed' else 'div'
+        content+='<'+tag+(' href="/backup/retries" aria-label="管理待重試錄音"' if key=='failed' else '')+' class="stat'+(' metric-warning' if key=='failed' and s[key] else '')+'"><span>'+label+'</span><strong id="'+key+'">'+str(s[key])+'</strong><small>'+('點此管理' if key=='failed' else '筆錄音')+'</small></'+tag+'> '
+    content+='</div><p class="retry-skipped-link"><a href="/backup/retries?view=skipped">已略過 <span id="skipped">'+str(s['skipped'])+'</span> 筆 · 管理重試錄音</a></p><div class="backup-progress"><p id="progress"></p><p class="error" id="backup-error"></p><small id="timing"></small></div><details><summary>備份位置與說明</summary><p>儲存位置：<code>/volume1/電話錄音</code>，錄音保存在 pcm。系統會補抓設備可提供的歷史錄音；已刪除或覆寫的錄音無法補抓。</p></details></section>'
     content+='<section><h2>本地錄音</h2>'+render_filters(filters,result)
     if not rows:content+='<p class="muted">沒有符合條件的本地記錄；可調整篩選範圍。歷史備份仍在回溯時，較早日期會陸續出現。</p>'
     else:
@@ -121,11 +124,11 @@ def main_page(filters,message=''):
         for r in rows:
             source='/recording/play?'+urllib.parse.urlencode(dict(date=r['day'],key=r['key']))
             title=r['timestamp'].replace('T',' ')+' · '+(r['PhoneNumber'] or '未知電話')+' · '+r['direction']
-            action='<div class="recording-actions"><button type="button" class="recording-play" data-recording-src="'+esc(source)+'" data-recording-label="'+esc(title)+'" aria-label="播放 '+esc(title)+'" aria-pressed="false">'+icon('play')+'<span class="play-label">播放</span></button>'+form('/download',hidden('date',r['day'])+hidden('key',r['key'])+'<button>下載 WAV</button>')+'</div>' if r['backed_up'] else ('<span class="error">備份待重試</span>' if r['error'] else '等待備份' if r['has_audio'] else '無音檔')
+            action='<div class="recording-actions"><button type="button" class="recording-play" data-recording-src="'+esc(source)+'" data-recording-label="'+esc(title)+'" aria-label="播放 '+esc(title)+'" aria-pressed="false">'+icon('play')+'<span class="play-label">播放</span></button>'+form('/download',hidden('date',r['day'])+hidden('key',r['key'])+'<button>下載 WAV</button>')+'</div>' if r['backed_up'] else ('<a href="/backup/retries?view=skipped">已略過備份</a>' if r['skipped'] else '<a class="error" href="/backup/retries">備份待重試</a>' if r['error'] else '等待備份' if r['has_audio'] else '無音檔')
             tag={'撥入':'incoming','撥出':'outgoing'}.get(r['direction'],'')
             content+='<tr><td><time>'+esc(r['timestamp'].replace('T',' '))+'</time></td><td>'+esc(r['RecChannel']+1)+'</td><td><span class="direction-tag '+tag+'">'+esc(r['direction'])+'</span></td><td><span class="phone-number">'+esc(r['PhoneNumber'])+'</span></td><td>'+esc(r['RecTime'])+'</td><td>'+action+'</td></tr>'
         content+='</table></div>'+render_pagination(filters,result)
-    content+='</section><script>async function update(){try{const s=await(await fetch("/api/status")).json();for(const k of ["saved","total","failed"])document.getElementById(k).textContent=s[k];document.getElementById("failed").closest(".stat").classList.toggle("metric-warning",s.failed>0);document.getElementById("progress").textContent=(s.phase||"準備首次備份")+(s.current_date?" · 處理日期 "+s.current_date:"")+" · 已掃描 "+s.scanned_days+" 天";document.getElementById("backup-error").textContent=s.error||"";document.getElementById("timing").textContent="上次完整成功："+(s.last_success||"首次備份尚未完成").replace("T"," ")+"　下次執行："+(s.running?"本輪結束後依設定間隔":(s.next_backup||"即將開始").replace("T"," "));let b=document.getElementById("backup-button");b.disabled=s.running;b.textContent=s.running?"備份進行中":"立即備份";}catch(e){}}update();setInterval(update,6000)</script>'
+    content+='</section><script>async function update(){try{const s=await(await fetch("/api/status")).json();for(const k of ["saved","total","failed","skipped"])document.getElementById(k).textContent=s[k];document.getElementById("failed").closest(".stat").classList.toggle("metric-warning",s.failed>0);document.getElementById("progress").textContent=(s.phase||"準備首次備份")+(s.current_date?" · 處理日期 "+s.current_date:"")+" · 已掃描 "+s.scanned_days+" 天";document.getElementById("backup-error").textContent=s.error||"";document.getElementById("timing").textContent="上次完整成功："+(s.last_success||"首次備份尚未完成").replace("T"," ")+"　下次執行："+(s.running?"本輪結束後依設定間隔":(s.next_backup||"即將開始").replace("T"," "));let b=document.getElementById("backup-button");b.disabled=s.running;b.textContent=s.running?"備份進行中":"立即備份";}catch(e){}}update();setInterval(update,6000)</script>'
     return shell('錄音與自動備份',content+recording_player())
 
 def voices_page(message=''):
@@ -223,6 +226,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path=='/api/connection':self.reply(200,json.dumps(dict(connection=CONNECTION.snapshot(),backup=BACKUP.status()),ensure_ascii=False),'application/json');return
             if u.path=='/api/status':self.reply(200,json.dumps(BACKUP.status(),ensure_ascii=False),'application/json');return
             if u.path=='/':self.reply(200,main_page(parse_filters(q),q.get('message',[''])[0]));return
+            if u.path=='/backup/retries':
+                result=ARCHIVE.retry_queue(q.get('view',['pending'])[0],int(q.get('page',['1'])[0]))
+                self.reply(200,shell('重試錄音管理',render_retries(result,ARCHIVE.stats(),CSRF,q.get('message',[''])[0])));return
             if u.path=='/settings':
                 if q.get('file'):
                     params={key:q[key][0] for key in ('message','file') if q.get(key)}
@@ -249,7 +255,9 @@ class Handler(BaseHTTPRequestHandler):
                 name=part.get_param('name',header='content-disposition')
                 if name=='audio':args['audio']=part.get_payload(decode=True);args['label']=part.get_filename() or '招呼語'
                 elif name=='csrf':args['csrf']=part.get_payload(decode=True).decode()
-        else:args={k:v[0] for k,v in urllib.parse.parse_qs(content.decode()).items()}
+        else:
+            parsed=urllib.parse.parse_qs(content.decode());args={k:v[0] for k,v in parsed.items()}
+            if self.path=='/backup/retries/action':args['items']=[json.loads(value) for value in parsed.get('item',[])]
         try:validate_form_source(self.headers,args.get('csrf',''),CSRF)
         except SourceError:
             # Header values only: never log the uploaded data or the nonce.
@@ -259,6 +267,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             args=self.arguments()
+            if self.path=='/backup/retries/action':
+                operation=args.get('operation','');count=ARCHIVE.retry_action(args.get('items',[]),operation)
+                if operation=='retry':BACKUP.wake.set()
+                message=('已略過 '+str(count)+' 筆錄音，保留紀錄並停止自動重試' if operation=='skip' else '已排入 '+str(count)+' 筆錄音重試')
+                view=args.get('view','pending');view=view if view in ('pending','skipped') else 'pending'
+                self.redirect('/backup/retries?'+urllib.parse.urlencode(dict(view=view,message=message)));return
             if self.path in ('/live/start','/live/stop'):
                 try:
                     if self.path=='/live/start':result=device(lambda c:LIVE.start(c,int(args['line'])))

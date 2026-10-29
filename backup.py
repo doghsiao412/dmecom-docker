@@ -14,6 +14,14 @@ from discovery import DiscoveryError
 from dmecom import ProtocolError, RecordingUnavailable, atomic_write, recording_filename, rows_from_index, standard_wav, normalize_record
 
 class RecordingConversionError(ProtocolError): pass
+class RecordingSkipped(Exception): pass
+
+# One definition shared by the retry list, counters, and background worker.
+UNSAVED = "json_extract(row_json,'$.has_audio')=1 AND (saved_version IS NULL OR saved_version!=version OR pcm IS NULL)"
+NOT_SKIPPED = '(skipped_version IS NULL OR skipped_version!=version)'
+FAILED = UNSAVED + ' AND error IS NOT NULL AND ' + NOT_SKIPPED
+SKIPPED = UNSAVED + ' AND skipped_version=version'
+
 
 def now(): return dt.datetime.now().isoformat(timespec='seconds')
 def identity(row): return hashlib.sha256(row['RecFilePath'].encode()).hexdigest()[:24]
@@ -54,7 +62,7 @@ class Archive:
             CREATE TABLE IF NOT EXISTS days(day TEXT PRIMARY KEY, checked TEXT, error TEXT);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);''')
             columns={r[1] for r in db.execute('PRAGMA table_info(recordings)')}
-            for name,kind in [('pcm_hash','TEXT'),('pcm_size','INTEGER')]:
+            for name,kind in [('pcm_hash','TEXT'),('pcm_size','INTEGER'),('skipped_version','TEXT'),('skipped_at','TEXT')]:
                 if name not in columns:db.execute('ALTER TABLE recordings ADD COLUMN '+name+' '+kind)
     def db(self):
         db=sqlite3.connect(self.database,timeout=30);db.row_factory=sqlite3.Row;return db
@@ -66,7 +74,7 @@ class Archive:
     def _decode(self,data):
         out=[]
         for r in data:
-            row=normalize_record(json.loads(r['row_json']));row.update(day=r['day'],key=r['key'],backed_up=r['saved_version']==r['version'] and bool(r['pcm']) and (self.root/r['pcm']).is_file(),error=r['error']);out.append(row)
+            row=normalize_record(json.loads(r['row_json']));row.update(day=r['day'],key=r['key'],backed_up=r['saved_version']==r['version'] and bool(r['pcm']) and (self.root/r['pcm']).is_file(),error=r['error'],version=r['version'],skipped=r['skipped_version']==r['version'],skipped_at=r['skipped_at'] if r['skipped_version']==r['version'] else None);out.append(row)
         return out
     def rows(self,day):
         dt.date.fromisoformat(day)
@@ -91,6 +99,37 @@ class Archive:
             pages=max(1,(total+page_size-1)//page_size);page=min(page,pages)
             data=db.execute("SELECT * FROM recordings"+where+" ORDER BY json_extract(row_json,'$.timestamp'),day,key LIMIT ? OFFSET ?",args+[page_size,(page-1)*page_size]).fetchall()
         return dict(rows=self._decode(data),total=total,backed_up=saved,page=page,pages=pages,page_size=page_size)
+    def retry_queue(self,view='pending',page=1,page_size=100):
+        if view not in ('pending','skipped'):raise ValueError('無效的重試清單')
+        if not isinstance(page,int) or not 1<=page<=1000000 or not 1<=page_size<=100:raise ValueError('無效頁碼')
+        where=FAILED if view=='pending' else SKIPPED
+        with self.db() as db:
+            total=db.execute('SELECT count(*) FROM recordings WHERE '+where).fetchone()[0]
+            pages=max(1,(total+page_size-1)//page_size);page=min(page,pages)
+            rows=db.execute("SELECT * FROM recordings WHERE "+where+" ORDER BY json_extract(row_json,'$.timestamp') DESC,day,key LIMIT ? OFFSET ?",(page_size,(page-1)*page_size)).fetchall()
+        return dict(rows=self._decode(rows),total=total,page=page,pages=pages,view=view)
+    def retry_action(self,items,operation):
+        if operation not in ('skip','retry'):raise ValueError('無效的重試操作')
+        if not isinstance(items,list) or not 1<=len(items)<=100:raise ValueError('請先勾選 1～100 筆錄音')
+        selected=[]
+        for item in items:
+            if not isinstance(item,list) or len(item)!=3 or not all(isinstance(v,str) for v in item):raise ValueError('無效錄音識別資料')
+            day,key,revision=item;dt.date.fromisoformat(day)
+            if not key or len(key)>128 or not revision or len(revision)>128:raise ValueError('無效錄音識別資料')
+            if item not in selected:selected.append(item)
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            # Validate the entire batch before changing anything. A completed
+            # download or refreshed index must never be overwritten by an old tab.
+            for day,key,revision in selected:
+                row=db.execute('SELECT version FROM recordings WHERE day=? AND key=? AND '+UNSAVED,(day,key)).fetchone()
+                if not row or row['version']!=revision:raise ValueError('錄音狀態已變更，請重新整理清單後操作')
+            for day,key,revision in selected:
+                db.execute('UPDATE recordings SET skipped_version=?,skipped_at=? WHERE day=? AND key=?',
+                           (revision if operation=='skip' else None,now() if operation=='skip' else None,day,key))
+        return len(selected)
+    def is_skipped(self,day,key):
+        with self.db() as db:return db.execute('SELECT 1 FROM recordings WHERE day=? AND key=? AND skipped_version=version',(day,key)).fetchone() is not None
     def ingest(self,day,data):
         rows=[normalize_record(r) for r in rows_from_index(data)] # Keep the original caller ID alongside display normalization.
         if data:atomic_write(self.root/'indexes'/(day+'.sqlite'),data)
@@ -107,6 +146,7 @@ class Archive:
     def save(self,day,row,fetch):
         key=identity(row);cached=self.cached(day,key)
         if cached:return cached,False
+        if self.is_skipped(day,key):raise RecordingSkipped('此筆錄音已略過')
         if shutil.disk_usage(self.root).free<512*1024*1024:raise OSError('NAS 可用空間少於 512 MB，備份暫停')
         relative=Path(day)/str(row['AutoID'])/recording_filename(row)
         original=(self.root/'original'/relative).with_suffix('.dar.wav')
@@ -125,10 +165,11 @@ class Archive:
         with self.db() as db:
             saved=db.execute('SELECT count(*),coalesce(sum(json_extract(row_json,\'$.FileSize\')),0) FROM recordings WHERE saved_version=version AND pcm IS NOT NULL').fetchone()
             total=db.execute('SELECT count(*) FROM recordings WHERE json_extract(row_json,\'$.has_audio\')=1').fetchone()[0]
-            failed=db.execute('SELECT count(*) FROM recordings WHERE error IS NOT NULL').fetchone()[0]
+            failed=db.execute('SELECT count(*) FROM recordings WHERE '+FAILED).fetchone()[0]
+            skipped=db.execute('SELECT count(*) FROM recordings WHERE '+SKIPPED).fetchone()[0]
             days=db.execute('SELECT count(*) FROM days').fetchone()[0]
             bounds=db.execute('SELECT min(day),max(day) FROM recordings').fetchone()
-        return dict(saved=saved[0],original_bytes=saved[1],total=total,failed=failed,scanned_days=days,oldest=bounds[0],newest=bounds[1])
+        return dict(saved=saved[0],original_bytes=saved[1],total=total,failed=failed,skipped=skipped,scanned_days=days,oldest=bounds[0],newest=bounds[1])
 
 class Backup:
     def __init__(self,archive,read_index,read_audio,config=None):
@@ -170,9 +211,10 @@ class Backup:
             # Include archived pending rows even if the recorder has rotated its index.
             for row in self.archive.rows(day):
                 if self.stop.is_set():return
-                if not row['has_audio'] or self.archive.cached(day,row['key']):continue
+                if not row['has_audio'] or row['skipped'] or self.archive.cached(day,row['key']):continue
                 self.update(current_record=row['timestamp'])
                 try:self.archive.save(day,row,self.read_audio)
+                except RecordingSkipped:continue
                 except (RecordingUnavailable,RecordingConversionError) as e:
                     self.archive.record_error(day,row['key'],str(e))
                 except Exception as e:
@@ -189,7 +231,7 @@ class Backup:
         day=today
         while day>=first and not self.stop.is_set():self.sync_day(day.isoformat());day-=dt.timedelta(days=1)
         with self.archive.db() as db:
-            retry=[r[0] for r in db.execute("SELECT DISTINCT day FROM recordings WHERE json_extract(row_json,'$.has_audio')=1 AND (saved_version IS NULL OR saved_version!=version OR error IS NOT NULL)")]
+            retry=[r[0] for r in db.execute("SELECT DISTINCT day FROM recordings WHERE "+UNSAVED+" AND "+NOT_SKIPPED)]
             retry += [r[0] for r in db.execute('SELECT day FROM days WHERE error IS NOT NULL')]
         for day in sorted(set(retry),reverse=True):
             if self.stop.is_set():return
