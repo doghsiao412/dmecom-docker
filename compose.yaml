@@ -1,0 +1,35 @@
+services:
+  dmecom:
+    build: .
+    image: dmecom-nas:local
+    container_name: dmecom-recorder
+    restart: unless-stopped
+    network_mode: host
+    user: "${DMECOM_UID:-1026}:${DMECOM_GID:-100}"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    environment:
+      TZ: Asia/Taipei
+      DMECOM_CONFIG: /config/config.json
+      DMECOM_DATA: /data
+    volumes:
+      - ./config.json:/config/config.json:ro
+      - ./state:/state
+      - ${DMECOM_DATA_DIR:-/volume1/電話錄音}:/data
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

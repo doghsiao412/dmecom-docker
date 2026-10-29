@@ -1,2 +1,124 @@
 # dmecom-docker
-Docker-based NAS management console for DMECOM DAR-A4100LS recorders: backups, playback, greetings, and answering settings.
+
+DMECOM DAR-A4100LS 電話錄音機的 Docker／NAS 管理台。以 NAS 保存錄音備份，透過網頁查詢、播放，並管理招呼語及已驗證的設備設定。
+
+本專案是獨立實作；協定根據原廠程式分析與指定設備驗證，相關記錄見 [PROTOCOL.md](PROTOCOL.md)。不同型號及韌體需另行核對。倉庫只包含程式碼、合成測試資料及設定範例。
+
+## 功能
+
+- 區網依 MAC 尋找設備，IP 變更後重新探索；連線前核對設備 MAC。
+- 預設每小時備份，可立即備份、補抓所有可取得的歷史錄音，重啟後接續進度。
+- 錄音按時間範圍、電話與來去電篩選、分頁；直接播放、暫停、拖曳及倍速。
+- 錄音保存單一 PCM WAV 格式；播放、下載直接使用 NAS 副本，設備離線時仍可使用。
+- 檔名為 `YYYYMMDD-HHMMSS-電話-IN.wav`／`OUT.wav`，保留原始索引與校驗碼。
+- 招呼語上傳、預聽、傳送、讀回校驗；管理設備上的語音檔、改名、刪除與還原副本。
+- 招呼語可設定顯示名稱；名稱存於 NAS，不更改設備檔名。
+- 每線接聽宣告開關、音檔選擇、寫入前版本核對與最近變更還原。
+- 線路響鈴、接聽時限、每週答錄時段，以及設備時間讀取與校正。
+- 左側功能選單、桌面／平板／手機版型。
+
+答錄排程保存在錄音機內，由設備依自身時間執行；備份排程及顯示名稱保存在 NAS。
+
+## 環境需求
+
+- Linux NAS／主機，Docker Engine 與 Docker Compose。
+- 錄音機與 NAS 位於可互通的同一實體區網；使用設備 TCP 6066。
+- 區網探索使用 host 網路及 `NET_RAW`，支援最多 4096 位址的直接連線網段。
+- 有效的錄音機帳號及密碼。
+
+容器使用 Python 3.11 與 FFmpeg，以非 root 使用者執行、唯讀根檔案系統及 `/tmp` tmpfs；只保留探索所需的 `NET_RAW` 能力。
+
+## Docker 安裝
+
+```sh
+git clone https://github.com/doghsiao412/dmecom-docker.git
+cd dmecom-docker
+cp config.example.json config.json
+cp .env.example .env
+mkdir -p state
+```
+
+1. 修改 `config.json` 的設備 MAC、帳號與密碼。範例 MAC 為合成值，必須換成自己的設備。
+2. 修改 `.env` 的 `DMECOM_UID`、`DMECOM_GID` 與 `DMECOM_DATA_DIR`，對應 NAS 上的使用者及資料共用資料夾。預設資料位置為 `/volume1/電話錄音`。
+3. 確認該使用者能讀取 `config.json`，並能寫入資料資料夾及 `state/`。
+4. 啟動：
+
+```sh
+chmod 600 config.json
+docker compose up -d --build
+docker compose ps
+```
+
+服務預設只監聽 NAS 的 `127.0.0.1:8766`。可使用既有 Tailscale Serve TCP 代理，將對外的 TCP 8766 轉送至 `127.0.0.1:8766`，或配置適當的反向代理。
+
+管理台本身沒有登入畫面；能連到管理埠的人可操作管理功能。應由 Tailscale 存取規則或反向代理控制可使用的人員，避免直接公開至網際網路。
+
+```sh
+docker compose logs --tail 100
+docker compose restart
+docker compose stop
+```
+
+## 設定範例
+
+```json
+{
+  "device_mac": "02:00:00:00:00:01",
+  "port": 6066,
+  "username": "YOUR_RECORDER_ACCOUNT",
+  "password": "YOUR_RECORDER_PASSWORD",
+  "listen_host": "127.0.0.1",
+  "discovery_cache": "/state/device-address.json"
+}
+```
+
+可選的 `history_start` 可限制歷史回溯起點，例如 `2025-01-01`；未指定時掃描正值 OLE 日期至 `1899-12-30`。遇到空日期仍繼續回溯。已從設備刪除、覆寫或不在索引內的錄音無法補抓。
+
+## 頁面
+
+| 路徑 | 功能 |
+| --- | --- |
+| `/` | 錄音、篩選、播放、下載與備份概況 |
+| `/voices` | 設備招呼語、顯示名稱、預聽與上傳 |
+| `/announcement` | 接聽宣告開關及音檔選擇 |
+| `/settings` | 線路、每週答錄、設備時間及備份排程 |
+| `/healthz` | 容器健康檢查 |
+
+接聽宣告是人員接起來電後播放的告知；每週自動答錄另由設備設定管理。未指定音檔的線路不能直接啟用宣告。寫入會讀回確認並留下還原記錄。
+
+設備音檔仍被接聽宣告或任何答錄時段引用時（含停用時段），須先切換引用再改名／刪除。改名以新名稱上傳相同編碼音訊、校驗後刪除舊檔；變更前會保留 NAS 副本。支援已核對的 8 kHz 單聲道 IMA ADPCM 格式，無法確認完整性的檔案不開放破壞性操作。
+
+## 持久資料
+
+`DMECOM_DATA_DIR` 掛載為容器 `/data`：
+
+| 位置 | 內容 |
+| --- | --- |
+| `archive.sqlite` | 錄音索引、版本、進度及錯誤 |
+| `pcm/` | PCM WAV 錄音 |
+| `indexes/` | 從設備取得的每日 SQLite 索引 |
+| `greetings/` | NAS 上傳音檔、預聽與清單 |
+| `device-voices/` | 設備音檔副本及管理記錄 |
+| `voice-display-names.json` | 招呼語顯示名稱 |
+| `answer-settings/` | 答錄設定及還原記錄 |
+| `pickup-announcements/` | 接聽宣告設定及還原記錄 |
+| `connection-status.json` | 最後連線狀態 |
+| `device-clock.json` | 設備時間讀取快照 |
+
+`config.json` 與 `state/` 另行掛載。更新／重建映像不會移除上述資料。備份整個資料資料夾時也應保存設定與還原記錄。
+
+`archive_migration.py`、`pcm_cleanup.py` 為既有資料格式遷移工具；新安裝不必執行。遷移流程會核對音訊與保存記錄，詳見程式說明。
+
+## 測試
+
+除 Python 標準函式庫外，音訊測試需要本機可執行的 `ffmpeg` 與 `ffprobe`。
+
+```sh
+python3 -m unittest discover -s . -v
+```
+
+測試使用暫存目錄、合成音訊及模擬設備，不需要提供正式帳密或連線錄音機。涵蓋 MAC 核對、備份續傳、PCM 完整性、時間與線路設定、變更還原、宣告開關、語音檔管理、播放的 HTTP 範圍請求及顯示名稱保存。
+
+## 原始碼與資料分離
+
+`.gitignore` 排除帳密設定、`.env`、錄音、資料庫、定位快取、操作記錄及音訊檔；`.dockerignore` 只允許建置所需的原始碼。請以 `config.example.json` 與 `.env.example` 作為範本，勿將自己的執行資料放進倉庫。

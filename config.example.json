@@ -1,0 +1,8 @@
+{
+  "device_mac": "02:00:00:00:00:01",
+  "port": 6066,
+  "username": "YOUR_RECORDER_ACCOUNT",
+  "password": "YOUR_RECORDER_PASSWORD",
+  "listen_host": "127.0.0.1",
+  "discovery_cache": "/state/device-address.json"
+}
