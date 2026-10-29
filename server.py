@@ -34,22 +34,26 @@ from device_voices_ui import render_device_voices,render_voice_confirmation
 from voice_names import VoiceNames,label_for
 from media import serve_wav
 from recording_ui import recording_player
+from live_monitor import LiveMonitor,LiveError
+from live_ui import render_live
 ROOT=Path(__file__).resolve().parent
 os.umask(0o077)
 CONFIG=json.loads(Path(os.environ.get('DMECOM_CONFIG',str(ROOT/'config.json'))).read_text())
 DATA=Path(os.environ.get('DMECOM_DATA',str(ROOT/'data')))
 LOCK=threading.Lock();SESSION=None;CSRF=secrets.token_hex(24)
+LIVE=LiveMonitor()
 
 def invalidate():
     global SESSION
     if SESSION:SESSION.__exit__(None,None,None);SESSION=None
+    LIVE.disconnected()
 
 def device(fn):
     global SESSION
     with LOCK:
         try:
             if SESSION is None:
-                candidate=Client(CONFIG);candidate.__enter__();SESSION=candidate
+                candidate=Client(CONFIG);candidate.on_frame=LIVE.handle;candidate.__enter__();SESSION=candidate
             result=fn(SESSION);CONNECTION.success(SESSION.address);return result
         except RecordingUnavailable:
             CONNECTION.success(SESSION.address if SESSION else None);raise
@@ -59,12 +63,14 @@ def device(fn):
 def keepalive():
     last=0
     while True:
-        time.sleep(1)
+        time.sleep(.05 if LIVE.snapshot()['line'] is not None else .5)
         with LOCK:
             if SESSION:
                 try:
                     if time.monotonic()-last>=5:SESSION.send(7,0,b'\0\0');last=time.monotonic()
-                    while select.select([SESSION.sock],[],[],0)[0]:
+                    LIVE.tick(SESSION)
+                    until=time.monotonic()+.1
+                    while time.monotonic()<until and select.select([SESSION.sock],[],[],0)[0]:
                         SESSION.receive();CONNECTION.success(SESSION.address)
                 except (OSError,ProtocolError) as e:CONNECTION.failure(e);invalidate()
 
@@ -200,6 +206,17 @@ class Handler(BaseHTTPRequestHandler):
         u=urllib.parse.urlsplit(self.path);q=urllib.parse.parse_qs(u.query,keep_blank_values=True)
         try:
             if u.path=='/healthz':self.reply(200,'ok','text/plain');return
+            if u.path=='/live':self.reply(200,shell('即時監聽',render_live(CSRF)));return
+            if u.path=='/api/live/status':
+                LIVE.watch();self.reply(200,json.dumps(dict(live=LIVE.snapshot(),connection=CONNECTION.snapshot()),ensure_ascii=False),'application/json');return
+            if u.path=='/api/live/audio':
+                try:
+                    after=int(q.get('after',['0'])[0])
+                    if after<0:raise LiveError('無效音訊序號')
+                    result=LIVE.chunks(q.get('token',[''])[0],after)
+                    self.reply(200,json.dumps(result),'application/json')
+                except (ValueError,KeyError) as e:self.reply(409,json.dumps(dict(error=str(e)),ensure_ascii=False),'application/json')
+                return
             if u.path=='/api/device-settings':self.reply(200,json.dumps(dict(clock=CLOCK.snapshot(),answer=ANSWER.snapshot()),ensure_ascii=False),'application/json');return
             if u.path=='/api/connection':self.reply(200,json.dumps(dict(connection=CONNECTION.snapshot(),backup=BACKUP.status()),ensure_ascii=False),'application/json');return
             if u.path=='/api/status':self.reply(200,json.dumps(BACKUP.status(),ensure_ascii=False),'application/json');return
@@ -240,6 +257,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             args=self.arguments()
+            if self.path in ('/live/start','/live/stop'):
+                try:
+                    if self.path=='/live/start':result=device(lambda c:LIVE.start(c,int(args['line'])))
+                    else:LIVE.detach(args.get('token',''));result=dict(stopped=True)
+                    self.reply(200,json.dumps(result),'application/json')
+                except (ValueError,KeyError,OSError,ProtocolError,DiscoveryError) as e:self.reply(409,json.dumps(dict(error=str(e)),ensure_ascii=False),'application/json')
+                return
             if self.path in ('/voice/prepare','/voice/apply'):raise ValueError('接聽控制欄位重新核對中，舊套用入口已停用；上傳音檔不會更改線路設定')
             if self.path.startswith('/voice/device/'):
                 if self.path=='/voice/device/label':VOICE_NAMES.set(args['name'],args.get('label',''));message='招呼語顯示名稱已儲存'
@@ -310,6 +334,7 @@ class Handler(BaseHTTPRequestHandler):
             target='/settings' if self.path.startswith(('/clock/','/answer/')) else '/voices'
             anchor='#device-clock' if self.path.startswith('/clock/') else '#line-settings' if self.path.startswith('/answer/') else ''
             self.redirect(target+'?message='+urllib.parse.quote(message)+anchor)
+        except (BrokenPipeError,ConnectionResetError):return
         except (OSError,ValueError,KeyError,ProtocolError,DiscoveryError,subprocess.SubprocessError) as e:
             self.reply(400,shell('操作未完成','<section><h2>操作未完成</h2><p class="error">'+esc(e)+'</p><a href="/">錄音與備份</a> · <a href="/voices">招呼語</a> · <a href="/settings">設備設定</a></section>'))
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DAR-A4100LS archive and narrowly scoped announcement client."""
+"""DAR-A4100LS archive, announcement and receive-only monitoring client."""
 import argparse, contextlib, datetime, json, os, select, socket, sqlite3, struct, tempfile, time
 from pathlib import Path
 from discovery import resolve_device, DiscoveryError
@@ -16,7 +16,7 @@ def packet(cmd, sub, data=b''):
     return struct.pack('<HBB',len(data)+2,cmd,sub)+data
 
 class Client:
-    def __init__(self, config): self.config=config; self.sock=None
+    def __init__(self, config): self.config=config; self.sock=None; self.on_frame=None
     def __enter__(self):
         try:
             self.address=resolve_device(self.config)
@@ -64,6 +64,9 @@ class Client:
             from answer import parse_weekly
             parse_weekly(data[3:]);allowed.add((8,1))
         if (cmd,sub)==(8,0) and len(data)==3 and data[0]==1 and data[1] in {6,0x11,0x2b,0x2c,0x2d,0x2e,0x2f,0x36,0x37,0x38,0x39,0x3a} and data[2]<4:allowed.add((8,0))
+        if (cmd,sub)==(10,0) and data==bytes(5):allowed.add((10,0))
+        if (cmd,sub)==(15,1) and len(data)==6 and data[0]<4 and data[1:]==bytes(5):allowed.add((15,1))
+        if cmd==15 and sub in (2,4) and data==bytes(5):allowed.add((15,sub))
         if (cmd,sub) not in allowed: raise ProtocolError('Command is not in the verified allowlist')
         self.sock.sendall(packet(cmd,sub,data))
     def exact(self,n):
@@ -78,7 +81,20 @@ class Client:
         if n<2: raise ProtocolError('Invalid frame length')
         frame=h+self.exact(n)
         if frame[2]!=21:self.events=(getattr(self,'events',[])+['%d/%d:%d'%(frame[2],frame[3],len(frame))])[-12:]
+        if self.on_frame:self.on_frame(self,frame)
         return frame
+    def live_status(self):
+        self.send(10,0,bytes(5))
+    def live_start(self,line):
+        if type(line) is not int or not 0<=line<4:raise ValueError("無效監聽線路")
+        self.send(15,1,bytes([line])+bytes(5))
+        p=self.wait(15,1)
+        if len(p)!=6 or p[4:]!=bytes([1,line]):raise ProtocolError("設備未接受監聽要求")
+    def live_stop(self):
+        self.send(15,2,bytes(5));p=self.wait(15,2)
+        if len(p)!=6 or p[4]!=1:raise ProtocolError("設備未確認停止監聽")
+    def live_next(self):
+        self.send(15,4,bytes(5))
     def wait(self,cmd,sub=None):
         deadline=time.monotonic()+20;seen=[]
         while time.monotonic()<deadline:

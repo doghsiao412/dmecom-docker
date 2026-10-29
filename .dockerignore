@@ -29,3 +29,6 @@
 !voice_names.py
 !media.py
 !recording_ui.py
+
+!live_monitor.py
+!live_ui.py
