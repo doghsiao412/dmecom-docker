@@ -181,7 +181,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         for name,value in [('Content-Type',ctype),('Cache-Control','no-store'),('Referrer-Policy','same-origin'),('X-Content-Type-Options','nosniff'),('X-Frame-Options','DENY'),('Content-Length',str(len(data)))]:self.send_header(name,value)
         if filename:self.send_header('Content-Disposition',"attachment; filename=\"recording.wav\"; filename*=UTF-8''"+urllib.parse.quote(filename,safe=''))
-        self.end_headers();self.wfile.write(data)
+        self.end_headers()
+        try:self.wfile.write(data)
+        except (BrokenPipeError,ConnectionResetError):pass
     def redirect(self,url):
         self.send_response(303);self.send_header('Location',url);self.send_header('Content-Length','0');self.end_headers()
     def media_request(self,u,q,head=False):

@@ -6,6 +6,7 @@ from discovery import resolve_device, DiscoveryError
 
 class ProtocolError(RuntimeError): pass
 class RecordingUnavailable(ProtocolError): pass
+class LoginBusy(ProtocolError): pass
 
 def voice_filename(name,max_units=127):
     if not isinstance(name,str) or not name or len(name.encode('utf-16le'))>max_units*2 or not name.lower().endswith('.wav') or name!=name.strip() or any(c in name for c in '/\\:*?"<>|') or any(ord(c)<32 for c in name) or name in ('.','..'):
@@ -29,6 +30,7 @@ class Client:
                 body[offset:offset+len(encoded)]=encoded
             self.send(1,0,body)
             result=self.wait(1)
+            if result[3]==5:raise LoginBusy('設備仍保留同帳號登入（status 5），正在等待釋放後自動重試')
             if result[3]!=2: raise ProtocolError('Login rejected (status %d)'%result[3])
             return self
         except Exception:
@@ -102,13 +104,38 @@ class Client:
             if p[2]!=21:seen.append('%d/%d:%d'%(p[2],p[3],len(p)))
             if p[2]==cmd and (sub is None or p[3]==sub): return p
         raise ProtocolError('未收到設備回應 %d/%s（其他封包 %s）'%(cmd,sub if sub is not None else '*',','.join(getattr(self,'events',seen)[-8:])))
+    download_end_grace=3
+    def cancel_audio(self):
+        self.audio_cancelled=True
+        self.send(12,8,b'\0\0')
+        # A read-only, correlated control reply is a barrier after cancellation.
+        # It drains late download replies before another recording can start.
+        self.clock()
+    def wait_audio(self,sub):
+        deadline=time.monotonic()+20;ended=None
+        while True:
+            remaining=min(deadline,ended if ended is not None else deadline)-time.monotonic()
+            if remaining<=0:break
+            if not select.select([self.sock],[],[],min(.2,remaining))[0]:continue
+            p=self.receive()
+            if p[2]!=12:continue
+            if p[3]==sub:return p
+            if p[3]==9:
+                if p[4:]!=b'\0\0':raise ProtocolError('未知的設備下載結束回應')
+                # A previous successful download can have a late close reply.
+                # Give this request time to produce its own expected response.
+                if ended is None:ended=time.monotonic()+self.download_end_grace
+        if ended is not None:
+            self.cancel_audio()
+            raise RecordingUnavailable('設備結束此筆錄音下載，未取得完整音檔；記錄已保留，後續會重試')
+        raise ProtocolError('未收到設備回應 12/%d（其他封包 %s）'%(sub,','.join(getattr(self,'events',[])[-8:])))
     def transfer(self,expected,sub,stop,max_bytes):
         if expected>max_bytes: raise ProtocolError('Transfer exceeds configured size limit')
         out=bytearray()
         try:
             while len(out)<expected:
                 self.send(12,sub,struct.pack('<I',min(32768,expected-len(out))))
-                p=self.wait(12,sub)
+                p=self.wait_audio(sub) if sub==7 else self.wait(12,sub)
                 if len(p)<8: raise ProtocolError('Short transfer frame')
                 declared=struct.unpack_from('<I',p,4)[0];chunk=p[8:]
                 if declared!=len(chunk) or not chunk: raise ProtocolError('Invalid transfer chunk')
@@ -116,7 +143,8 @@ class Client:
                 if len(out)>expected: raise ProtocolError('Transfer length mismatch')
             return bytes(out)
         finally:
-            with contextlib.suppress(OSError,ProtocolError): self.send(12,stop,b'\0\0')
+            if sub!=7 or not getattr(self,'audio_cancelled',False):
+                with contextlib.suppress(OSError,ProtocolError):self.send(12,stop,b'\0\0')
     def index(self,date):
         d=datetime.date.fromisoformat(date)
         body=struct.pack('<3H',d.year,d.month,d.day)+bytes(58)
@@ -144,11 +172,12 @@ class Client:
         body=bytearray(1008);encoded=path.encode('utf-16le')
         if len(encoded)>518: raise ProtocolError('Remote file path too long')
         body[384:384+len(encoded)]=encoded
-        self.send(12,6,body);p=self.wait(12,10)
+        self.audio_cancelled=False
+        self.send(12,6,body);p=self.wait_audio(10)
         if len(p)!=8: raise ProtocolError('Invalid audio size response')
         size=struct.unpack_from('<I',p,4)[0]
         if size<12:
-            self.send(12,8,b'\0\0');raise RecordingUnavailable('設備上的原始音檔已無法取得')
+            self.cancel_audio();raise RecordingUnavailable('設備上的原始音檔已無法取得')
         data=self.transfer(size,7,8,512*1024*1024)
         if data[:4]!=b'RIFF' or data[8:12]!=b'WAVE': raise ProtocolError('Downloaded file is not WAV')
         return data
