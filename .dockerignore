@@ -24,6 +24,7 @@
 !announcement_ui.py
 
 !ui_layout.py
+!theme.py
 
 !device_voices.py
 !device_voices_ui.py
