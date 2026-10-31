@@ -52,7 +52,8 @@ class Client:
                 name=data.decode('utf-16le').split('\0')[0];encoded=voice_filename(name).encode('utf-16le')
                 if data==encoded+bytes(256-len(encoded)):allowed.add((13,13))
             except (ValueError,UnicodeDecodeError):pass
-        if (cmd,sub)==(8,0) and data in (b'\0\x19',b'\0\x7b'):allowed.add((8,0))
+        if (cmd,sub)==(8,0) and data in (b'\0\x19',b'\0\x7b',b'\0\x15',b'\0\x16',b'\0\x23'):allowed.add((8,0))
+        if (cmd,sub)==(9,0) and data==b'\0\0':allowed.add((9,0))
         if (cmd,sub)==(8,1) and len(data)==18 and data[:2]==b'\0\x19':allowed.add((8,1))
         if (cmd,sub)==(8,1) and len(data)==7 and data[0]==1 and data[1] in {6,0x2b,0x2c,0x2d} and data[2]<4:
             value=struct.unpack_from('<I',data,3)[0]
@@ -189,6 +190,31 @@ class Client:
             p=self.wait(8,0)
             if p[4:6]==bytes([0,key]):return p[6:]
         raise ProtocolError('未收到設備全域參數')
+    def storage(self):
+        """Read-only card status, as the vendor storage page reads it on open."""
+        self.send(9,0,b'\0\0')
+        deadline=time.monotonic()+20
+        while True:
+            p=self.wait(9)
+            # 15-byte reply: total MB, free MB, one more DWORD. Longer cmd 9 frames are line status.
+            if len(p)==15:break
+            if time.monotonic()>deadline:raise ProtocolError('未收到記憶卡容量回應')
+        total,free=struct.unpack_from('<II',p,3)
+        if not 0<total<16*1024*1024 or free>total:raise ProtocolError('記憶卡容量資料無效')
+        def dword(key):
+            raw=self.global_parameter(key)
+            if len(raw)<4:raise ProtocolError('不支援的記憶卡參數格式')
+            return struct.unpack_from('<I',raw)[0]
+        reserve,loop=dword(0x15),dword(0x16)
+        if reserve>100 or loop not in (0,1):raise ProtocolError('記憶卡參數超出已知範圍')
+        last=None;raw=self.global_parameter(0x23)
+        if len(raw)>=20:
+            year,month,day,hour,minute,second=struct.unpack_from('<6H',raw)
+            deleted,freed=struct.unpack_from('<II',raw,12)
+            if deleted or freed:
+                try:last=datetime.datetime(year,month,day,hour,minute,second)
+                except ValueError:last=None
+        return dict(total_mb=total,free_mb=free,reserve_percent=reserve,loop_recording=bool(loop),last_loop_delete=last)
     def clock(self):
         payload=self.global_parameter(0x19)
         if len(payload)!=16:raise ProtocolError('不支援的設備時間格式')

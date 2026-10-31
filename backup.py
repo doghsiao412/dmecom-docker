@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import recording_query
 import time
 import wave
 from discovery import DiscoveryError
@@ -80,25 +81,27 @@ class Archive:
         dt.date.fromisoformat(day)
         with self.db() as db:data=db.execute('SELECT * FROM recordings WHERE day=? ORDER BY json_extract(row_json,\'$.RecDate\')',(day,)).fetchall()
         return self._decode(data)
-    def search(self,start='',end='',phone='',direction='ALL',page=1,page_size=100):
-        if direction not in ('ALL','IN','OUT','UNKNOWN'):raise ValueError('無效來去電條件')
+    def search(self,start='',end='',phone='',direction='ALL',page=1,page_size=100,call_type='ALL',line=0,min_seconds=None,max_seconds=None,sort='time'):
         if page<1 or not 1<=page_size<=200:raise ValueError('無效分頁條件')
-        clauses=[];args=[]
-        for value,operator in [(start,'>='),(end,'<=')]:
-            if value:
-                parsed=dt.datetime.fromisoformat(value)
-                if parsed.tzinfo is not None:raise ValueError('請使用台北當地時間')
-                canonical=parsed.isoformat(timespec='seconds')
-                clauses.extend(['day '+operator+' ?',"json_extract(row_json,'$.timestamp') "+operator+' ?']);args.extend([parsed.date().isoformat(),canonical])
-        if start and end and dt.datetime.fromisoformat(start)>dt.datetime.fromisoformat(end):raise ValueError('開始時間不可晚於結束時間')
-        if phone:clauses.append("instr(coalesce(json_extract(row_json,'$.PhoneNumber'),''),?)>0");args.append(phone)
-        if direction!='ALL':clauses.append("coalesce(json_extract(row_json,'$.direction'),'未知')=?");args.append({'IN':'撥入','OUT':'撥出','UNKNOWN':'未知'}[direction])
-        where=' WHERE '+' AND '.join(clauses) if clauses else ''
+        if sort not in recording_query.SORTS:raise ValueError('無效排序方式')
+        where,args=recording_query.where_clause(start,end,phone,direction,call_type,line,min_seconds,max_seconds)
         with self.db() as db:
             total,saved=db.execute('SELECT count(*),coalesce(sum(CASE WHEN saved_version=version AND pcm IS NOT NULL THEN 1 ELSE 0 END),0) FROM recordings'+where,args).fetchone()
             pages=max(1,(total+page_size-1)//page_size);page=min(page,pages)
-            data=db.execute("SELECT * FROM recordings"+where+" ORDER BY json_extract(row_json,'$.timestamp'),day,key LIMIT ? OFFSET ?",args+[page_size,(page-1)*page_size]).fetchall()
+            data=db.execute("SELECT * FROM recordings"+where+" ORDER BY "+recording_query.SORTS[sort][1]+" LIMIT ? OFFSET ?",args+[page_size,(page-1)*page_size]).fetchall()
         return dict(rows=self._decode(data),total=total,backed_up=saved,page=page,pages=pages,page_size=page_size)
+    def export(self,limit=100000,sort='time',page=None,**filters):
+        if sort not in recording_query.SORTS:raise ValueError('無效排序方式')
+        where,args=recording_query.where_clause(**filters)
+        with self.db() as db:
+            total=db.execute('SELECT count(*) FROM recordings'+where,args).fetchone()[0]
+            if total>limit:raise ValueError('符合 %d 筆，超過匯出上限 %d 筆，請縮小範圍'%(total,limit))
+            data=db.execute("SELECT * FROM recordings"+where+" ORDER BY "+recording_query.SORTS[sort][1],args).fetchall()
+        return self._decode(data)
+    def statistics(self,period='day',sort=None,page=None,**filters):
+        if period not in recording_query.PERIODS:raise ValueError('無效統計週期')
+        where,args=recording_query.where_clause(**filters)
+        with self.db() as db:return recording_query.statistics(db,where,args,period)
     def retry_queue(self,view='pending',page=1,page_size=100):
         if view not in ('pending','skipped'):raise ValueError('無效的重試清單')
         if not isinstance(page,int) or not 1<=page<=1000000 or not 1<=page_size<=100:raise ValueError('無效頁碼')

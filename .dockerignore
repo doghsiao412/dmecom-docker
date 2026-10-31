@@ -7,6 +7,7 @@
 !voice.py
 !web_security.py
 !device_clock.py
+!device_storage.py
 !answer.py
 
 !settings_ui.py
@@ -16,6 +17,7 @@
 !connection_status.py
 
 !recording_filters.py
+!recording_query.py
 !pcm_cleanup.py
 
 !announcement.py

@@ -22,10 +22,12 @@ from backup import Archive,Backup
 from voice import Voices,ima_payload
 from web_security import validate_form_source,SourceError
 from device_clock import DeviceClock,local_now
+from device_storage import DeviceStorage,summary as storage_summary
 from answer import AnswerSettings
 from settings_ui import render_settings,parse_line_form
 from connection_status import ConnectionStatus
-from recording_filters import parse_filters,render_filters,render_pagination
+from recording_filters import parse_filters,render_filters,render_pagination,link as filter_link,query_items
+import recording_query
 from announcement import PickupAnnouncements
 from announcement_ui import render_announcement,render_confirmation
 from ui_layout import page_shell,icon
@@ -80,6 +82,7 @@ CONNECTION=ConnectionStatus(DATA)
 BACKUP=Backup(ARCHIVE,lambda day:device(lambda c:c.index(day)),lambda row:device(lambda c:c.audio(row)),CONFIG)
 VOICES=Voices(DATA,device)
 CLOCK=DeviceClock(DATA,device)
+STORAGE=DeviceStorage(DATA,device)
 ANSWER=AnswerSettings(DATA,device)
 PICKUP=PickupAnnouncements(DATA,device)
 VOICE_NAMES=VoiceNames(DATA)
@@ -126,10 +129,42 @@ def main_page(filters,message=''):
             title=r['timestamp'].replace('T',' ')+' · '+(r['PhoneNumber'] or '未知電話')+' · '+r['direction']
             action='<div class="recording-actions"><button type="button" class="recording-play" data-recording-src="'+esc(source)+'" data-recording-label="'+esc(title)+'" aria-label="播放 '+esc(title)+'" aria-pressed="false">'+icon('play')+'<span class="play-label">播放</span></button>'+form('/download',hidden('date',r['day'])+hidden('key',r['key'])+'<button>下載 WAV</button>')+'</div>' if r['backed_up'] else ('<a href="/backup/retries?view=skipped">已略過備份</a>' if r['skipped'] else '<a class="error" href="/backup/retries">備份待重試</a>' if r['error'] else '等待備份' if r['has_audio'] else '無音檔')
             tag={'撥入':'incoming','撥出':'outgoing'}.get(r['direction'],'')
-            content+='<tr><td><time>'+esc(r['timestamp'].replace('T',' '))+'</time></td><td>'+esc(r['RecChannel']+1)+'</td><td><span class="direction-tag '+tag+'">'+esc(r['direction'])+'</span></td><td><span class="phone-number">'+esc(r['PhoneNumber'])+'</span></td><td>'+esc(r['RecTime'])+'</td><td>'+action+'</td></tr>'
+            kind=r.get('RecType');note='<span class="type-note'+(' auto' if kind==7 else '')+'">'+esc(recording_query.type_label(r))+'</span>' if kind in (4,5,6,7) else ''
+            content+='<tr><td><time>'+esc(r['timestamp'].replace('T',' '))+'</time></td><td>'+esc(r['RecChannel']+1)+'</td><td><span class="direction-tag '+tag+'">'+esc(r['direction'])+'</span>'+note+'</td><td><span class="phone-number">'+esc(r['PhoneNumber'])+'</span></td><td>'+esc(r['RecTime'])+'</td><td>'+action+'</td></tr>'
         content+='</table></div>'+render_pagination(filters,result)
     content+='</section><script>async function update(){try{const s=await(await fetch("/api/status")).json();for(const k of ["saved","total","failed","skipped"])document.getElementById(k).textContent=s[k];document.getElementById("failed").closest(".stat").classList.toggle("metric-warning",s.failed>0);document.getElementById("progress").textContent=(s.phase||"準備首次備份")+(s.current_date?" · 處理日期 "+s.current_date:"")+" · 已掃描 "+s.scanned_days+" 天";document.getElementById("backup-error").textContent=s.error||"";document.getElementById("timing").textContent="上次完整成功："+(s.last_success||"首次備份尚未完成").replace("T"," ")+"　下次執行："+(s.running?"本輪結束後依設定間隔":(s.next_backup||"即將開始").replace("T"," "));let b=document.getElementById("backup-button");b.disabled=s.running;b.textContent=s.running?"備份進行中":"立即備份";}catch(e){}}update();setInterval(update,6000)</script>'
     return shell('錄音與自動備份',content+recording_player())
+
+def stats_page(filters,period):
+    result=ARCHIVE.statistics(period=period,**{k:v for k,v in filters.items() if k not in ('page','sort')})
+    def url(**o):
+        data=dict(query_items(filters),period=period);data.update(o);return '/stats?'+urllib.parse.urlencode(data)
+    scope=[]
+    if filters['start'] or filters['end']:scope.append((filters['start'] or '最早').replace('T',' ')+' ～ '+(filters['end'] or '最新').replace('T',' '))
+    else:scope.append('不限日期')
+    for key,label in [('phone','電話'),('min_seconds','最短秒數'),('max_seconds','最長秒數')]:
+        if filters[key] not in ('',None):scope.append(label+' '+str(filters[key]))
+    if filters['direction']!='ALL':scope.append({'IN':'撥入','OUT':'撥出','UNKNOWN':'未知'}[filters['direction']])
+    if filters['call_type']!='ALL':scope.append(recording_query.CALL_TYPES[filters['call_type']][0])
+    if filters['line']:scope.append('線路 '+str(filters['line']))
+    content='<section><div class="section-heading"><div><h2>通話統計</h2><p>範圍：'+esc('，'.join(scope))+'。只讀取 NAS 已備份的索引，不需要答錄機連線。</p></div></div>'
+    content+='<form method="get" action="/stats" class="stats-range">'+''.join(hidden(k,v) for k,v in query_items(filters).items() if k not in ('start','end','page'))+hidden('period',period)+'<div class="filter-grid"><label>開始時間 <input type="datetime-local" name="start" step="1" value="'+esc(filters['start'])+'"></label><label>結束時間 <input type="datetime-local" name="end" step="1" value="'+esc(filters['end'])+'"></label></div><div class="filter-actions"><button>套用範圍</button><a href="'+esc(url(start='',end=''))+'">不限日期</a><a href="'+esc(filter_link(filters,page=1))+'">回到錄音清單</a></div></form>'
+    content+='<nav class="period-tabs" aria-label="統計週期">'+''.join('<a href="'+esc(url(period=k))+'" aria-current="'+('true' if k==period else 'false')+'">'+v+'</a>' for k,v in recording_query.PERIODS.items())+'</nav>'
+    T=result['totals']
+    content+='<div class="stat-totals">'+''.join('<div><span>'+label+'</span><strong>'+esc(value)+'</strong></div>' for label,value in [('總筆數',T['total']),('來電',T['incoming']),('去電',T['outgoing']),('來電未接',T['missed']),('有通話未錄音',T['unrecorded']),('錄音總長',recording_query.duration(T['seconds']))])+'</div>'
+    if not result['rows']:content+='<p class="muted">此範圍沒有記錄。</p>'
+    else:
+        content+='<div class="scroll"><table><tr><th>期間</th><th>總數</th><th>來電</th><th>去電</th><th>來電未接</th><th>未錄音</th><th>自動回應</th><th>錄音總長</th></tr>'
+        for r in result['rows']:content+='<tr><td>'+esc(r['period'] if period!='week' else r['period']+' 起')+'</td><td>'+str(r['total'])+'</td><td>'+str(r['incoming'])+'</td><td>'+str(r['outgoing'])+'</td><td>'+str(r['missed'])+'</td><td>'+str(r['unrecorded'])+'</td><td>'+str(r['auto'])+'</td><td>'+recording_query.duration(r['seconds'])+'</td></tr>'
+        content+='</table></div>'
+    content+='<small>來電含自動回應；週以星期一為起始。</small></section>'
+    return shell('通話統計',content)
+
+def export_workbook(filters):
+    rows=ARCHIVE.export(**{k:v for k,v in filters.items() if k!='page'})
+    data=recording_query.xlsx(recording_query.EXPORT_HEADER,(recording_query.export_row(r) for r in rows))
+    stamp=local_now().strftime('%Y%m%d-%H%M%S')
+    return data,'錄音清單-'+stamp+'.xlsx'
 
 def voices_page(message=''):
     content='<p class="ok">'+esc(message)+'</p>' if message else ''
@@ -156,7 +191,7 @@ def voices_page(message=''):
 
 def settings_page(message=''):
     content='<p class="ok">'+esc(message)+'</p>' if message else ''
-    content+='<nav class="settings-jump" aria-label="設備設定區塊"><a href="#line-settings">線路與答錄設定</a><a href="#device-clock">設備時間</a><a href="#backup-settings">備份排程</a></nav>'
+    content+='<nav class="settings-jump" aria-label="設備設定區塊"><a href="#line-settings">線路與答錄設定</a><a href="#device-storage">記憶卡</a><a href="#device-clock">設備時間</a><a href="#backup-settings">備份排程</a></nav>'
     answer=ANSWER.snapshot();files=VOICES.snapshot()['files'];items=VOICES.items()
     content+=render_settings(answer,files,BACKUP.interval,CSRF,VOICE_NAMES.all())
     if not answer.get('active') and not answer.get('pending'):
@@ -165,12 +200,25 @@ def settings_page(message=''):
             content+='<section><h2>夜間接聽快速方案</h2><p>選擇已傳送的重複 3 次／40 秒版本，套用至全部 4 條線路，每天 20:00～翌日 11:00；40 秒結束。會保存原設定供還原。</p>'
             for item in candidates:content+=form('/answer/enable',hidden('key',item['key'])+'<p>'+esc(item['label'])+'</p><button>套用夜間接聽方案</button>')
             content+='</section>'
+    content+=storage_section()
     clock=CLOCK.snapshot()
     content+='<section id="device-clock"><h2>設備時間</h2><p>NAS 台北時間：'+esc(local_now().strftime('%Y-%m-%d %H:%M:%S'))+'</p>'
     if clock:content+='<p>答錄機時間：'+esc(clock.get('device'))+' · 相差 '+esc(clock.get('difference_seconds'))+' 秒</p><small>讀取時間：'+esc(clock.get('checked'))+'</small>'
     content+=form('/clock/read','<button>讀取設備時間</button>')+form('/clock/sync','<button>校正為 NAS 台北時間</button>')+'</section>'
     content+="<script>if(location.hash==='#announcement')location.replace('/announcement'+location.search)</script>"
     return shell('設備設定',content)
+
+def storage_section():
+    info=STORAGE.snapshot()
+    body='<section id="device-storage"><h2>記憶卡</h2><p>答錄機上的記憶卡容量與循環錄音設定，只讀取，不修改設備。</p>'
+    if info:
+        s=storage_summary(info)
+        body+=''.join('<p class="error">'+esc(w)+'</p>' for w in s['warnings'])
+        body+='<div class="scroll"><table><tr><th>容量</th><td>'+esc(s['total'])+'</td></tr><tr><th>已使用</th><td>'+esc(s['used'])+'（'+esc(s['used_percent'])+'）</td></tr><tr><th>剩餘</th><td>'+esc(s['free'])+'</td></tr>'
+        body+='<tr><th>循環錄音</th><td>'+('開啟' if info['loop_recording'] else '關閉')+'</td></tr><tr><th>保留空間</th><td>'+esc(info['reserve_percent'])+'%</td></tr>'
+        body+='<tr><th>上次循環刪除</th><td>'+esc(info.get('last_loop_delete') or '沒有記錄')+'</td></tr></table></div>'+('<p class="muted">循環錄音開啟時，剩餘空間低於保留比例會自動刪除最舊的錄音。</p>' if info['loop_recording'] else '')+'<small>讀取時間：'+esc(info.get('checked'))+'</small>'
+    else:body+='<p>尚未讀取。</p>'
+    return body+form('/storage/read','<button>讀取記憶卡狀態</button>')+'</section>'
 
 def announcement_page(message='',selected=''):
     content='<p class="ok">'+esc(message)+'</p>' if message else ''
@@ -183,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(data,str):data=data.encode()
         self.send_response(code)
         for name,value in [('Content-Type',ctype),('Cache-Control','no-store'),('Referrer-Policy','same-origin'),('X-Content-Type-Options','nosniff'),('X-Frame-Options','DENY'),('Content-Length',str(len(data)))]:self.send_header(name,value)
-        if filename:self.send_header('Content-Disposition',"attachment; filename=\"recording.wav\"; filename*=UTF-8''"+urllib.parse.quote(filename,safe=''))
+        if filename:self.send_header('Content-Disposition',"attachment; filename=\"recording"+Path(filename).suffix+"\"; filename*=UTF-8''"+urllib.parse.quote(filename,safe=''))
         self.end_headers()
         try:self.wfile.write(data)
         except (BrokenPipeError,ConnectionResetError):pass
@@ -222,10 +270,18 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(200,json.dumps(result),'application/json')
                 except (ValueError,KeyError) as e:self.reply(409,json.dumps(dict(error=str(e)),ensure_ascii=False),'application/json')
                 return
-            if u.path=='/api/device-settings':self.reply(200,json.dumps(dict(clock=CLOCK.snapshot(),answer=ANSWER.snapshot()),ensure_ascii=False),'application/json');return
+            if u.path=='/api/device-settings':self.reply(200,json.dumps(dict(clock=CLOCK.snapshot(),storage=STORAGE.snapshot(),answer=ANSWER.snapshot()),ensure_ascii=False),'application/json');return
             if u.path=='/api/connection':self.reply(200,json.dumps(dict(connection=CONNECTION.snapshot(),backup=BACKUP.status()),ensure_ascii=False),'application/json');return
             if u.path=='/api/status':self.reply(200,json.dumps(BACKUP.status(),ensure_ascii=False),'application/json');return
             if u.path=='/':self.reply(200,main_page(parse_filters(q),q.get('message',[''])[0]));return
+            if u.path=='/stats':
+                period=q.get('period',['month'])[0]
+                if period not in recording_query.PERIODS:raise ValueError('無效統計週期')
+                filters=parse_filters(q) if any(k in q for k in ('start','end','date')) else dict(parse_filters(q),start='',end='')
+                self.reply(200,stats_page(filters,period));return
+            if u.path=='/recordings/export.xlsx':
+                data,name=export_workbook(parse_filters(q))
+                self.reply(200,data,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',name);return
             if u.path=='/backup/retries':
                 result=ARCHIVE.retry_queue(q.get('view',['pending'])[0],int(q.get('page',['1'])[0]))
                 self.reply(200,shell('重試錄音管理',render_retries(result,ARCHIVE.stats(),CSRF,q.get('message',[''])[0])));return
@@ -313,7 +369,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=='/connection/retry':
                 CLOCK.inspect();BACKUP.trigger();self.redirect('/settings?message='+urllib.parse.quote('已找到答錄機並讀取時間，備份工作已排入'));return
             if self.path.startswith('/settings/'):
-                if self.path=='/settings/refresh':VOICES.inspect();ANSWER.inspect();message='已重新讀取設備設定'
+                if self.path=='/settings/refresh':VOICES.inspect();ANSWER.inspect();STORAGE.inspect();message='已重新讀取設備設定與記憶卡狀態'
                 elif self.path=='/settings/save':
                     line=int(args['line'])
                     if not 1<=line<=4:raise ValueError('無效線路')
@@ -344,11 +400,12 @@ class Handler(BaseHTTPRequestHandler):
                 ANSWER.configure(meta['name'],verify);message='已套用夜間接聽方案並讀回全部設定；請實際來電確認播放與掛斷'
             elif self.path=='/answer/restore':ANSWER.restore();message='已還原啟用前的接聽設定並讀回確認'
             elif self.path=='/clock/read':CLOCK.inspect();message='已讀取設備時間'
+            elif self.path=='/storage/read':STORAGE.inspect();message='已讀取記憶卡狀態'
             elif self.path=='/clock/sync':CLOCK.sync();message='設備時間已校正並讀回確認'
             elif self.path=='/answer/read':ANSWER.inspect();message='已讀取答錄設定'
             else:self.reply(404,'Not found','text/plain');return
-            target='/settings' if self.path.startswith(('/clock/','/answer/')) else '/voices'
-            anchor='#device-clock' if self.path.startswith('/clock/') else '#line-settings' if self.path.startswith('/answer/') else ''
+            target='/settings' if self.path.startswith(('/clock/','/answer/','/storage/')) else '/voices'
+            anchor='#device-clock' if self.path.startswith('/clock/') else '#device-storage' if self.path.startswith('/storage/') else '#line-settings' if self.path.startswith('/answer/') else ''
             self.redirect(target+'?message='+urllib.parse.quote(message)+anchor)
         except (BrokenPipeError,ConnectionResetError):return
         except (OSError,ValueError,KeyError,ProtocolError,DiscoveryError,subprocess.SubprocessError) as e:
